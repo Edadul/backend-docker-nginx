@@ -2,7 +2,7 @@
 
 ## 1. Descripción de la solución
 
-API REST desarrollada con **Node.js 24, Express 5 y TypeScript**, empaquetada en una imagen Docker multi-stage y publicada detrás de **Nginx**, que actúa como reverse proxy. Ambos servicios se orquestan con **Docker Compose**.
+API REST desarrollada con **Node.js 24, Express 5 y TypeScript**, empaquetada en una imagen Docker multi-stage y publicada detrás de **Nginx**, que actúa como reverse proxy. Como reto adicional se incluye un servicio **Redis**, que demuestra la comunicación entre contenedores por nombre DNS. Los tres servicios se orquestan con **Docker Compose**.
 
 La API expone los siguientes endpoints:
 
@@ -12,7 +12,7 @@ La API expone los siguientes endpoints:
 | GET    | `/api/products`      | Lista todos los productos (datos mock)        |
 | GET    | `/api/products/:id`  | Obtiene un producto por id (400 / 404 si falla) |
 
-El contenedor de la API **no publica puertos al host**: el único punto de entrada es Nginx en el puerto `8080`.
+Ni la API ni Redis **publican puertos al host**: el único punto de entrada es Nginx en el puerto `8080`.
 
 ## 2. Arquitectura implementada
 
@@ -29,8 +29,16 @@ El contenedor de la API **no publica puertos al host**: el único punto de entra
   │  │   │    nginx      │ ──────────────▶ │    api     │  │ │
   │  │   │  :8080        │  http://api:3000│  :3000     │  │ │
   │  │   │ (reverse proxy)│                │ (Express)  │  │ │
-  │  │   └───────────────┘                 └────────────┘  │ │
+  │  │   └───────────────┘                 └─────┬──────┘  │ │
   │  │                                   expose: "3000"    │ │
+  │  │                                         │           │ │
+  │  │                        redis://redis:6379 (DNS)     │ │
+  │  │                                         ▼           │ │
+  │  │                                   ┌────────────┐    │ │
+  │  │                                   │   redis    │    │ │
+  │  │                                   │  :6379     │    │ │
+  │  │                                   └────────────┘    │ │
+  │  │                                   expose: "6379"    │ │
   │  └─────────────────────────────────────────────────────┘ │
   └──────────────────────────────────────────────────────────┘
 ```
@@ -40,7 +48,7 @@ El contenedor de la API **no publica puertos al host**: el único punto de entra
 ```
 .
 ├── Dockerfile              # Imagen multi-stage de la API (builder + runner)
-├── compose.yml             # Orquestación de api + nginx
+├── compose.yml             # Orquestación de api + nginx + redis
 ├── nginx/nginx.conf        # Configuración del reverse proxy
 ├── src/
 │   ├── main.ts             # Punto de entrada (lee PORT)
@@ -59,7 +67,9 @@ El contenedor de la API **no publica puertos al host**: el único punto de entra
   - Etapa `builder`: instala todas las dependencias con pnpm y compila TypeScript a `dist/`.
   - Etapa `runner`: instala solo dependencias de producción y copia `dist/` desde el builder, generando una imagen final más liviana.
   - Escucha en el puerto `3000` (variable `PORT`) y solo lo expone dentro de la red de Docker (`expose`).
+  - Recibe `REDIS_URL=redis://redis:6379` y depende de `redis` (`depends_on`).
 - **`nginx`** — Imagen `nginx:stable-alpine` con `nginx/nginx.conf` montado en solo lectura. Escucha en `8080`, reenvía todo el tráfico a `http://api:3000` y agrega las cabeceras `Host`, `X-Real-IP`, `X-Forwarded-For` y `X-Forwarded-Proto`. Publica el puerto `8080` al host y depende de `api` (`depends_on`).
+- **`redis`** — Imagen oficial `redis:alpine`. Solo expone el puerto `6379` dentro de la red de Docker. Todavía no tiene lógica de negocio; se usa para demostrar la resolución DNS entre servicios (ver [sección 9](#9-reto-adicional-servicio-redis)).
 - **Red** — Compose crea automáticamente la red bridge `backend-docker-nginx_default`, donde cada servicio se resuelve por su nombre gracias al DNS interno de Docker.
 
 ## 3. Instrucciones para ejecutar el proyecto
@@ -74,7 +84,7 @@ cd backend-docker-nginx
 # 2. Construir las imágenes y levantar los servicios en segundo plano
 docker compose up -d --build
 
-# 3. Verificar que ambos contenedores estén corriendo
+# 3. Verificar que los tres contenedores (api, nginx, redis) estén corriendo
 docker compose ps
 
 # 4. Probar la API a través de Nginx
@@ -103,6 +113,8 @@ pnpm start        # http://localhost:3000
 | `docker compose logs api` / `docker compose logs nginx` | Muestra los logs de cada servicio |
 | `docker compose logs -f` | Sigue los logs en tiempo real |
 | `docker compose exec nginx wget -qO- http://api:3000/health` | Prueba la comunicación interna nginx → api por nombre de servicio |
+| `docker compose exec redis redis-cli -h redis ping` | Prueba que Redis responde usando su nombre de servicio |
+| `docker compose exec nginx nc -zv redis 6379` | Prueba desde nginx que `redis` se resuelve y el puerto 6379 está abierto |
 | `docker compose restart nginx` | Reinicia Nginx tras modificar `nginx.conf` |
 | `docker compose down` | Detiene y elimina contenedores y red |
 | `docker build -t backend-api .` | Construye solo la imagen de la API |
@@ -117,7 +129,7 @@ pnpm start        # http://localhost:3000
 | Formato | `"HOST:CONTENEDOR"` (ej. `"8080:8080"`) | `"PUERTO"` (ej. `"3000"`) |
 | Accesible desde el host | ✅ Sí | ❌ No |
 | Accesible desde otros contenedores de la misma red | ✅ Sí | ✅ Sí |
-| Uso en este proyecto | `nginx` → `8080:8080` | `api` → `3000` |
+| Uso en este proyecto | `nginx` → `8080:8080` | `api` → `3000`, `redis` → `6379` |
 
 - **`ports`** publica (mapea) un puerto del contenedor en un puerto de la máquina host. Por eso `http://localhost:8080` llega a Nginx.
 - **`expose`** solo documenta/declara el puerto para la red interna de Docker; **no** lo abre al host. La API es alcanzable por Nginx (`api:3000`), pero no directamente desde fuera.
@@ -134,7 +146,7 @@ Cada contenedor tiene **su propio namespace de red**, así que `localhost` (`127
 | --- | --- | --- |
 | Host (tu máquina) | El propio host | `http://localhost:8080` (vía el puerto publicado de Nginx) |
 | Contenedor `nginx` | El propio contenedor de Nginx | `http://api:3000` (nombre del servicio) |
-| Contenedor `api` | El propio contenedor de la API | — |
+| Contenedor `api` | El propio contenedor de la API | — (para Redis usa `redis://redis:6379`) |
 
 - **`localhost`** dentro de un contenedor **no es el host ni otro contenedor**: es el mismo contenedor. Si Nginx hace `proxy_pass http://localhost:3000`, busca un proceso en el puerto 3000 *dentro del contenedor de Nginx*, donde no hay nada.
 - **El nombre del servicio** (`api`) es resuelto por el **DNS interno de Docker** a la IP del contenedor en la red de Compose. Por eso `nginx.conf` usa `proxy_pass http://api:3000;`.
@@ -145,9 +157,10 @@ Cada contenedor tiene **su propio namespace de red**, así que `localhost` (`127
 
 ```text
 $ docker compose ps
-NAME      IMAGE                     COMMAND                  SERVICE   STATUS         PORTS
-api       backend-docker-nginx-api  "docker-entrypoint.s…"   api       Up 5 minutes   3000/tcp
-nginx     nginx:stable-alpine       "/docker-entrypoint.…"   nginx     Up 5 minutes   80/tcp, 0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+NAME      IMAGE                      COMMAND                  SERVICE   STATUS           PORTS
+api       backend-docker-nginx-api   "docker-entrypoint.s…"   api       Up 3 seconds     3000/tcp
+nginx     nginx:stable-alpine        "/docker-entrypoint.…"   nginx     Up About an hour 80/tcp, 0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+redis     redis:alpine               "docker-entrypoint.s…"   redis     Up 8 minutes     6379/tcp
 ```
 
 ```text
@@ -270,3 +283,70 @@ proxy_pass http://api:3000;
 docker compose restart nginx
 curl -i http://localhost:8080/health   # HTTP/1.1 200 OK
 ```
+
+## 9. Reto adicional: servicio Redis
+
+Se agregó un tercer servicio, `redis`, para demostrar que los servicios se comunican usando los **nombres DNS que proporciona Docker Compose**. Todavía no hay lógica de negocio con Redis.
+
+### Configuración en `compose.yml`
+
+```yaml
+services:
+  api:
+    # ...
+    environment:
+      - PORT=3000
+      - REDIS_URL=redis://redis:6379   # Redis por su nombre de servicio, no por localhost
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:alpine
+    container_name: redis
+    expose:
+      - "6379"                         # solo dentro de la red de Docker
+```
+
+- Se usa la imagen oficial `redis:alpine`, así que no hace falta Dockerfile.
+- Se usa `expose` y no `ports`: Redis no queda accesible desde el host, solo desde los otros contenedores.
+- `REDIS_URL` deja lista la conexión para cuando la API use Redis, y apunta a `redis:6379`, no a `localhost:6379`.
+
+### Evidencias
+
+```text
+# Los tres contenedores están en la misma red
+$ docker network inspect backend-docker-nginx_default --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'
+nginx 172.18.0.3/16
+redis 172.18.0.4/16
+api 172.18.0.2/16
+
+# Redis responde usando su nombre de servicio
+$ docker compose exec redis redis-cli -h redis ping
+PONG
+
+# Desde nginx: "redis" se resuelve y el puerto 6379 está abierto
+$ docker compose exec nginx nc -zv redis 6379
+redis (172.18.0.4:6379) open
+
+# Desde la API (Node.js): resolución DNS
+$ docker compose exec api node -e "require('dns').lookup('redis',(e,a)=>console.log('api -> redis =',a))"
+api -> redis = 172.18.0.4
+
+# Desde la API: conexión real a Redis con un PING
+$ docker compose exec api node -e "require('net').connect(6379,'redis',function(){this.write('PING\r\n')}).on('data',d=>{console.log('api -> redis:',d.toString().trim());process.exit()})"
+api -> redis: +PONG
+
+# La variable de entorno llega al contenedor de la API
+$ docker compose exec api printenv REDIS_URL
+redis://redis:6379
+
+# Redis no es accesible desde el host (expose, no ports)
+$ nc -zv localhost 6379
+nc: connect to localhost (127.0.0.1) port 6379 (tcp) failed: Connection refused
+```
+
+### Por qué funciona
+
+Docker Compose conecta todos los servicios a la red `backend-docker-nginx_default`, cuyo DNS interno registra cada servicio por su nombre. Por eso `redis` se resuelve a la IP del contenedor de Redis (`172.18.0.4`), igual que `api` se resuelve en `nginx.conf`.
+
+Si la API usara `localhost:6379`, la conexión fallaría: dentro del contenedor `api`, `localhost` es el propio contenedor, donde no corre Redis. Es el mismo problema del 502 descrito en la [sección 8](#8-troubleshooting-error-producido-durante-el-ejercicio).
